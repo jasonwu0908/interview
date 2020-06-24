@@ -48,6 +48,8 @@ city_config = {
         'F_lvr_land_A.csv': '新北市',
         'H_lvr_land_A.csv': '桃園市'
         }
+
+
 # spark寫入elasticsearch設定
 es_write_conf = {
         'es.nodes': 'localhost', 
@@ -56,10 +58,14 @@ es_write_conf = {
         'es.input.json': 'yes',
         'es.mapping.id': 'serial number'}
 
+
 # 讀取資料夾路徑 hdfs
 InputDir = '/user/DemoData/'
+
+
 # 輸出資料夾路徑 hdfs
 OutputDir = '/tmp/Cathay/'
+
 
 # 讀取路徑資料夾下所有檔案，並新增城市資料，最後合併所有df
 def ReadData(dirPath, city_config, schema):
@@ -137,6 +143,8 @@ def main():
         df = df.withColumn(col_name, col(col_name).cast(IntegerType()))
     for col_name in float_cols:
         df = df.withColumn(col_name, col(col_name).cast(FloatType()))
+
+    df = df.cache()
 # ====================================================================================================================
 
 # ================================================ 第一題 ============================================================
