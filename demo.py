@@ -7,6 +7,8 @@ from pyspark.sql.types import *
 from functools import reduce as rd 
 from hdfs import InsecureClient
 
+
+# 定義欄位名稱與型態
 schema = StructType(
         [StructField("district", StringType(), True),
         StructField("transaction sign", StringType(), True),
@@ -38,6 +40,7 @@ schema = StructType(
         StructField("serial number", StringType(), True)])
 
 
+# 設定檔名與城市
 city_config = {
         'A_lvr_land_A.csv': '台北市',
         'B_lvr_land_A.csv': '台中市',
@@ -45,7 +48,7 @@ city_config = {
         'F_lvr_land_A.csv': '新北市',
         'H_lvr_land_A.csv': '桃園市'
         }
-
+# spark寫入elasticsearch設定
 es_write_conf = {
         'es.nodes': 'localhost', 
         'es.port': '9200',
@@ -53,11 +56,12 @@ es_write_conf = {
         'es.input.json': 'yes',
         'es.mapping.id': 'serial number'}
 
-
+# 讀取資料夾路徑 hdfs
 InputDir = '/user/DemoData/'
+# 輸出資料夾路徑 hdfs
 OutputDir = '/tmp/Cathay/'
 
-
+# 讀取路徑資料夾下所有檔案，並新增城市資料，最後合併所有df
 def ReadData(dirPath, city_config, schema):
     dfs = []
     for fn, city in city_config.items():
@@ -73,7 +77,7 @@ def ReadData(dirPath, city_config, schema):
     return df
 
 
-
+# 將民國轉為西元
 def convert_date(x):
     if x != None:
         if ((x != '') & (len(x)>4)):
@@ -91,12 +95,12 @@ def convert_date(x):
         return None
 
 
-
+# 將rdd資料型態轉為Elasticsearch支援格式
 def format_data(x):
     return (eval(x)['serial number'], x)
 
 
-
+# (第二題) 將輸出的檔案名稱由part-00000 -> result-part1.json
 def renameFiles(ip='10.61.100.134', port='9870', username='jw0908', MainName='result-part', SubName='.json', dirPath='/tmp/Cathay/'):
     client = InsecureClient("http://" + ip  + ":" + port, user=username)
     if dirPath[-1] != '/':
@@ -111,17 +115,21 @@ def renameFiles(ip='10.61.100.134', port='9870', username='jw0908', MainName='re
 
 
 def main():
+    
     spark = SparkSession\
             .builder\
-            .appName("demo1")\
+            .appName("demo")\
             .getOrCreate()
+    
     # 讀取目標資料夾下所有city_config中的檔案，並給予相對應城市欄位
     df = ReadData(InputDir, city_config, schema)
-    # 處理時間欄位
+    
+    # 透過UDF 將民國(string) 轉為 西元(date)
     udf_convert_date = udf(convert_date, StringType())
     df = df.withColumn('transaction date', to_date(udf_convert_date('transaction date'), 'yyyyMMdd'))
     df = df.withColumn('construction to complete the years', to_date(udf_convert_date('construction to complete the years'), 'yyyyMMdd'))
-    # 處理數值欄位
+    
+    # 處理數值欄位 string -> Integer & Float
     int_cols = ["Building present situation pattern - room", "Building present situation pattern - hall",\
                 "Building present situation pattern - health", "total price NTD", "the unit price (NTD / square meter)"]
     float_cols = ["land shifting total area square meter", "building shifting total area", "berth shifting total area square meter"]
@@ -135,11 +143,16 @@ def main():
 
 # ====================================================================================================================
 
-#    將資料寫入Elasticsearch
-
+#   將資料寫入Elasticsearch
 #   將資料轉成rdd json格式
     esData = df.toJSON()
+
+#   整理成elasticsearch支援格式
+#   '{'city':'台北市', transaction date: .....}'
+#   轉成
+#   ('serial number': xxxx, '{'city':'台北市', transaction date: .....}')
     esData = esData.map(lambda x: format_data(x))
+#   將資料寫入本地端Elasticsearch 
     esData.saveAsNewAPIHadoopFile(
             path='-',
             outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat",
@@ -153,22 +166,68 @@ def main():
 # ================================================ 第二題 ============================================================
 
 # ====================================================================================================================
+#   將資料整成 {city: 台北市, time_slots: [{date: 2020-01-01, events: [{district: 文山區, type: 其他}, ...]} ...]}
+#   使用collect_list和struct 將欄位弄成 nested column
 
-    # 將資料整成 {city: 台北市, time_slots: [{date: 2020-01-01, events: [{district: 文山區, type: 其他}, ...]} ...]}
-
+#   重新命名成題目樣式
     df2 = df.withColumnRenamed('building state', 'type')\
             .withColumnRenamed('transaction date', 'date')
+
+
+#   先 groupby 城市和日期已建立題目內events內容
+#   並對城市和交易日期做排序
     df2 = df2.groupby('city', 'date').agg(collect_list(struct(col('type'), col('district'))).alias('events'))
     df2 = df2.sort('city', desc('date'))
+#   ======================================================
+#   +------+----------+---------------------------+                                 
+#   |  city|      date|                     events|
+#   +------+----------+---------------------------+
+#   |台中市|2019-01-30|           [[其他, 大甲區]]|
+#   |台中市|2019-01-27|         [[透天厝, 太平區]]|
+#   |台中市|2019-01-25|           [[其他, 新社區]]|
+#   |台中市|2019-01-24|           [[其他, 梧棲區]]|
+#   |台中市|2019-01-23|[[其他, 大安區], [其他, ...|
+#   +------+----------+---------------------------+
+#   |-- city: string (nullable = false)
+#   |-- date: date (nullable = true)
+#   |-- events: array (nullable = true)
+#   |    |-- element: struct (containsNull = true)
+#   |    |    |-- type: string (nullable = true)
+#   |    |    |-- district: string (nullable = true)
+#   ======================================================
+
+
+#   再groupby 城市 以建立題目內time_slots 內容
     df2 = df2.groupby('city').agg(collect_list(struct(col('date'), col('events'))).alias('time_slots'))
+#   ======================================================
+#   +------+---------------------+                                                  
+#   |  city|           time_slots|
+#   +------+---------------------+
+#   |台北市|[[2019-04-01, [[住...|
+#   |新北市|[[2019-01-31, [[住...|
+#   |台中市|[[2019-01-30, [[其...|
+#   |高雄市|[[2019-01-31, [[店...|
+#   |桃園市|[[2019-01-28, [[其...|
+#   +------+---------------------+
+#   |-- city: string (nullable = false)
+#   |-- time_slots: array (nullable = true)
+#   |    |-- element: struct (containsNull = true)
+#   |    |    |-- date: date (nullable = true)
+#   |    |    |-- events: array (nullable = true)
+#   |    |    |    |-- element: struct (containsNull = true)
+#   |    |    |    |    |-- type: string (nullable = true)
+#   |    |    |    |    |-- district: string (nullable = true)
+#   ======================================================
+
+
+#   減少分區至2 已達到5座城市資料隨機分佈在2個檔案之中(part-00000, part-00001)
     data = df2.toJSON()
     data.coalesce(2, True).saveAsTextFile(OutputDir)
+
+#   重新命名為題目要求 result-part1.json ...
     result = renameFiles()
     print(result)
-    
     sc.stop()
-
-
 
 
 if __name__ == '__main__':
