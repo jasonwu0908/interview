@@ -2,7 +2,7 @@ import rlcompleter, readline
 readline.parse_and_bind('tab: complete')
 
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import monotonically_increasing_id, col, lit, udf, to_date, collect_list, struct, desc
+from pyspark.sql.functions import monotonically_increasing_id, col, lit, udf, to_date, collect_list, struct, desc, unix_timestamp, round
 from pyspark.sql.types import *
 from functools import reduce as rd 
 from hdfs import InsecureClient
@@ -68,7 +68,7 @@ OutputDir = '/tmp/Cathay/'
 
 
 # 讀取路徑資料夾下所有檔案，並新增城市資料，最後合併所有df
-def ReadData(dirPath, city_config, schema):
+def ReadData(dirPath, city_config, schema, spark):
     dfs = []
     for fn, city in city_config.items():
         fp = dirPath + fn
@@ -85,13 +85,13 @@ def ReadData(dirPath, city_config, schema):
 
 # 將民國轉為西元
 def convert_date(x):
-    if x != None:
-        if ((x != '') & (len(x)>4)):
-            x = x.strip()
+    if (x != None):
+        x = x.strip()
+        if ((x != '') & ((len(x) > 4) & (len(x) < 8)) ):
             month = x[-4:-2]
-            if ((int(month) <= 12) & (int(month) > 0)):
+            day = x[-2:]
+            if ( ((int(month) <= 12) & (int(month) > 0)) & ((int(day) < 32) & (int(day) > 0)) ):
                 year = str(int(x[:-4]) + 1911)
-                day = x[-2:]
                 return year + month + day
             else:
                 return None
@@ -101,13 +101,23 @@ def convert_date(x):
         return None
 
 
+def find_buildingType(x):
+    if (x != None):
+        building_type = x.strip().split('(')[0]
+        return building_type
+    else:
+        return None
+
+
+
+
 # 將rdd資料型態轉為Elasticsearch支援格式
 def format_data(x):
     return (eval(x)['serial number'], x)
 
 
 # (第二題) 將輸出的檔案名稱由part-00000 -> result-part1.json
-def renameFiles(ip='10.61.100.134', port='9870', username='jw0908', MainName='result-part', SubName='.json', dirPath='/tmp/Cathay/'):
+def renameFiles(ip='172.20.10.2', port='9870', username='jw0908', MainName='result-part', SubName='.json', dirPath='/tmp/Cathay/'):
     client = InsecureClient("http://" + ip  + ":" + port, user=username)
     if dirPath[-1] != '/':
         dirPath += '/'
@@ -128,13 +138,13 @@ def main():
             .getOrCreate()
     
     # 讀取目標資料夾下所有city_config中的檔案，並給予相對應城市欄位
-    df = ReadData(InputDir, city_config, schema)
+    df = ReadData(InputDir, city_config, schema, spark)
     
     # 透過UDF 將民國(string) 轉為 西元(date)
     udf_convert_date = udf(convert_date, StringType())
     df = df.withColumn('transaction date', to_date(udf_convert_date('transaction date'), 'yyyyMMdd'))
     df = df.withColumn('construction to complete the years', to_date(udf_convert_date('construction to complete the years'), 'yyyyMMdd'))
-    
+    # df = df.filter(col('transaction date') >= '2018-12-21').filter(col('transaction date') <= '2018-12-31')
     # 處理數值欄位 string -> Integer & Float
     int_cols = ["Building present situation pattern - room", "Building present situation pattern - hall",\
                 "Building present situation pattern - health", "total price NTD", "the unit price (NTD / square meter)"]
@@ -144,16 +154,25 @@ def main():
     for col_name in float_cols:
         df = df.withColumn(col_name, col(col_name).cast(FloatType()))
 
-    df = df.cache()
+    df_cached = df.cache()
+
 # ====================================================================================================================
 
 # ================================================ 第一題 ============================================================
 
 # ====================================================================================================================
+#   新增屋齡
+    df1 = df_cached.withColumn('house age', round( 
+        (unix_timestamp('transaction date', 'yyyy-MM-dd')-unix_timestamp('construction to complete the years', 'yyyy-MM-dd'))/ 31536000, 2))
+    
+#   房屋類別    
+    udf_find_buildingType = udf(find_buildingType, StringType())
+    df1 = df1.withColumn('building type', udf_find_buildingType('building state'))
 
 #   將資料寫入Elasticsearch
 #   將資料轉成rdd json格式
-    esData = df.toJSON()
+    esData = df1.toJSON()
+
 
 #   整理成elasticsearch支援格式
 #   '{'city':'台北市', transaction date: .....}'
@@ -168,7 +187,6 @@ def main():
             valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable",
             conf=es_write_conf)
 
-
 # ====================================================================================================================
 
 # ================================================ 第二題 ============================================================
@@ -176,10 +194,9 @@ def main():
 # ====================================================================================================================
 #   將資料整成 {city: 台北市, time_slots: [{date: 2020-01-01, events: [{district: 文山區, type: 其他}, ...]} ...]}
 #   使用collect_list和struct 將欄位弄成 nested column
-
 #   重新命名成題目樣式
-    df2 = df.withColumnRenamed('building state', 'type')\
-            .withColumnRenamed('transaction date', 'date')
+    df2 = df_cached.withColumnRenamed('building state', 'type')\
+                   .withColumnRenamed('transaction date', 'date')
 
 
 #   先 groupby 城市和日期已建立題目內events內容
@@ -228,14 +245,14 @@ def main():
 #   ======================================================
 
 
-#   減少分區至2 已達到5座城市資料隨機分佈在2個檔案之中(part-00000, part-00001)
+#   減少分區至2 ，以達到5座城市資料隨機分佈在2個檔案之中(part-00000, part-00001)
     data = df2.toJSON()
     data.coalesce(2, True).saveAsTextFile(OutputDir)
 
 #   重新命名為題目要求 result-part1.json ...
     result = renameFiles()
     print(result)
-    sc.stop()
+    spark.stop()
 
 
 if __name__ == '__main__':
