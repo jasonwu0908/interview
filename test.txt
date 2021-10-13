@@ -1,2 +1,3 @@
 123456
 conflict1
+conflict
